@@ -1,7 +1,8 @@
 fastapi
 uvicorn
+psycopg2
 sqlalchemy
-openai>=1.6.0
+google-generativeai
 pypdf
 python-multipart
 requests
