@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+sqlalchemy
+openai>=1.6.0
+pypdf
+python-multipart
+requests
+beautifulsoup4
+python-dotenv
