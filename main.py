@@ -12,7 +12,8 @@ from utils import (
     get_embedding,
     extract_text_from_pdf,
     cosine_similarity,
-    fetch_url_text
+    fetch_url_text,
+    generate_answer,
 )
 
 Base.metadata.create_all(bind=engine)
@@ -31,6 +32,15 @@ class DocumentChunk(Base):
     created_at = Column(DateTime, default=dt.datetime.utcnow)
 
 
+class InteractionLog(Base):
+    __tablename__ = "interaction_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    event_type = Column(Text, nullable=False)
+    payload = Column(Text)
+    created_at = Column(DateTime, default=dt.datetime.utcnow)
+
+
 class URLIngestRequest(BaseModel):
     url: HttpUrl
     source_type: str | None = "web"
@@ -38,6 +48,13 @@ class URLIngestRequest(BaseModel):
 
 class QuestionRequest(BaseModel):
     question: str
+
+
+def log_event(db: Session, event_type: str, payload: dict):
+    db.add(InteractionLog(
+        event_type=event_type,
+        payload=json.dumps(payload)
+    ))
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -176,9 +193,10 @@ def index():
 @app.post("/upload/pdf")
 async def upload_pdf(file: UploadFile = File(...), db: Session = Depends(get_db)):
     file_bytes = await file.read()
-    text = extract_text_from_pdf(file_bytes)
+    text, pdf_meta = extract_text_from_pdf(file_bytes)
 
     chunks = chunk_text(text)
+    chunk_details = []
     for ch in chunks:
         emb = get_embedding(ch)
         db.add(DocumentChunk(
@@ -187,18 +205,28 @@ async def upload_pdf(file: UploadFile = File(...), db: Session = Depends(get_db)
             chunk_text=ch,
             embedding=json.dumps(emb)
         ))
+        chunk_details.append({
+            "length": len(ch),
+            "preview": ch[:160]
+        })
+
+    log_event(db, "pdf_upload", {
+        "filename": file.filename,
+        "chunk_count": len(chunks),
+        "pdf_meta": pdf_meta,
+        "chunk_details": chunk_details
+    })
     db.commit()
 
-    return {"stored_chunks": len(chunks)}
+    return {"stored_chunks": len(chunks), "pdf_meta": pdf_meta}
 
 
 @app.post("/ingest/url")
 async def ingest_url(payload: URLIngestRequest, db: Session = Depends(get_db)):
     try:
-        text = fetch_url_text(str(payload.url))
+        text, scrape_meta = fetch_url_text(str(payload.url))
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Failed to fetch URL: {exc}") from exc
-
     if not text.strip():
         raise HTTPException(status_code=400, detail="No readable text extracted from the page.")
 
@@ -206,6 +234,7 @@ async def ingest_url(payload: URLIngestRequest, db: Session = Depends(get_db)):
     if not chunks:
         raise HTTPException(status_code=400, detail="Unable to chunk extracted text.")
 
+    chunk_details = []
     for ch in chunks:
         emb = get_embedding(ch)
         db.add(DocumentChunk(
@@ -214,9 +243,25 @@ async def ingest_url(payload: URLIngestRequest, db: Session = Depends(get_db)):
             chunk_text=ch,
             embedding=json.dumps(emb)
         ))
+        chunk_details.append({
+            "length": len(ch),
+            "preview": ch[:160]
+        })
+
+    log_event(db, "url_ingest", {
+        "url": str(payload.url),
+        "source_type": payload.source_type or "web",
+        "chunk_count": len(chunks),
+        "scrape_meta": scrape_meta,
+        "chunk_details": chunk_details
+    })
     db.commit()
 
-    return {"stored_chunks": len(chunks), "url": str(payload.url)}
+    return {
+        "stored_chunks": len(chunks),
+        "url": str(payload.url),
+        "scrape_meta": scrape_meta
+    }
 
 
 @app.post("/ask")
@@ -236,7 +281,21 @@ async def ask_question(payload: QuestionRequest, db: Session = Depends(get_db)):
 
     context = "\n\n".join(top)
 
+    try:
+        answer_text = generate_answer(context, payload.question)
+    except Exception as exc:
+        answer_text = (
+            "Answer generation failed; showing raw context instead.\n\n" + context
+        )
+
+    log_event(db, "question", {
+        "question": payload.question,
+        "context_used": top,
+        "answer": answer_text
+    })
+    db.commit()
+
     return {
         "context_used": top,
-        "answer": f"Based on context, here is the answer:\n\n{context}"
+        "answer": answer_text
     }
