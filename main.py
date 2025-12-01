@@ -6,6 +6,7 @@ from sqlalchemy import Column, Integer, Text, DateTime
 from sqlalchemy.orm import Session
 import datetime as dt
 
+
 from db import Base, engine, get_db
 from utils import (
     chunk_text,
