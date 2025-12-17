@@ -285,6 +285,10 @@ async def ask_question(payload: QuestionRequest, db: Session = Depends(get_db)):
     try:
         answer_text = generate_answer(context, payload.question)
     except Exception as exc:
+        log_event(db, "question_error", {
+        "question": payload.question,
+        "error": str(exc)
+            })
         answer_text = (
             "Answer generation failed; showing raw context instead.\n\n" + context
         )
