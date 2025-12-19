@@ -2,12 +2,18 @@ import json
 from fastapi import FastAPI, UploadFile, File, Depends, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, HttpUrl
-from sqlalchemy import Column, Integer, Text, DateTime
 from sqlalchemy.orm import Session
 import datetime as dt
+import uuid
 
 
 from db import Base, engine, get_db
+from models import (
+    DocumentChunk,
+    InteractionLog,
+    Conversation,
+    ConversationMessage,
+)
 from utils import (
     chunk_text,
     get_embedding,
@@ -16,30 +22,11 @@ from utils import (
     fetch_url_text,
     generate_answer,
 )
+from memory import MemoryService
 
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="MVP RAG Chatbot")
-
-
-class DocumentChunk(Base):
-    __tablename__ = "document_chunks"
-
-    id = Column(Integer, primary_key=True, index=True)
-    source_type = Column(Text)
-    source = Column(Text)
-    chunk_text = Column(Text)
-    embedding = Column(Text)
-    created_at = Column(DateTime, default=dt.datetime.utcnow)
-
-
-class InteractionLog(Base):
-    __tablename__ = "interaction_logs"
-
-    id = Column(Integer, primary_key=True, index=True)
-    event_type = Column(Text, nullable=False)
-    payload = Column(Text)
-    created_at = Column(DateTime, default=dt.datetime.utcnow)
 
 
 class URLIngestRequest(BaseModel):
@@ -49,6 +36,7 @@ class URLIngestRequest(BaseModel):
 
 class QuestionRequest(BaseModel):
     question: str
+    session_id: str | None = None  # Optional session ID for conversation continuity
 
 
 def log_event(db: Session, event_type: str, payload: dict):
@@ -103,6 +91,11 @@ def index():
 
     <section>
         <h2>3. Ask a Question</h2>
+        <div style="margin-bottom: 10px;">
+            <label for="session-id">Session ID (for conversation continuity):</label>
+            <input type="text" id="session-id" placeholder="Leave empty for new session" style="width: 70%;" />
+            <button type="button" id="new-session-btn" style="width: 28%; margin-left: 2%;">New Session</button>
+        </div>
         <form id="ask-form">
             <label for="question">Question</label>
             <input type="text" id="question" placeholder="Type your question..." required />
@@ -111,6 +104,7 @@ def index():
         <div>
             <h3>Answer</h3>
             <pre id="answer"></pre>
+            <div id="session-info" style="margin-top: 10px; font-size: 0.9em; color: #666;"></div>
         </div>
     </section>
 
@@ -162,23 +156,61 @@ def index():
             }
         });
 
+        let currentSessionId = null;
+        
+        const newSessionBtn = document.getElementById("new-session-btn");
+        newSessionBtn.addEventListener("click", async () => {
+            try {
+                const resp = await fetch("/conversations/new", { method: "POST" });
+                const data = await resp.json();
+                currentSessionId = data.session_id;
+                document.getElementById("session-id").value = currentSessionId;
+                document.getElementById("session-info").textContent = 
+                    `New session created: ${currentSessionId}`;
+            } catch (err) {
+                alert("Failed to create new session: " + err);
+            }
+        });
+
         const askForm = document.getElementById("ask-form");
         const askBtn = document.getElementById("ask-btn");
         const answerEl = document.getElementById("answer");
+        const sessionInfoEl = document.getElementById("session-info");
+        const sessionIdInput = document.getElementById("session-id");
+        
         askForm.addEventListener("submit", async (e) => {
             e.preventDefault();
             const question = document.getElementById("question").value.trim();
             if (!question) return;
+            
+            const sessionId = sessionIdInput.value.trim() || currentSessionId;
             askBtn.disabled = true;
             answerEl.textContent = "Thinking...";
+            sessionInfoEl.textContent = "";
+            
             try {
+                const payload = { question };
+                if (sessionId) {
+                    payload.session_id = sessionId;
+                }
+                
                 const resp = await fetch("/ask", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ question })
+                    body: JSON.stringify(payload)
                 });
                 const data = await resp.json();
-                answerEl.textContent = JSON.stringify(data, null, 2);
+                
+                // Display answer
+                answerEl.textContent = data.answer || JSON.stringify(data, null, 2);
+                
+                // Update session info
+                if (data.session_id) {
+                    currentSessionId = data.session_id;
+                    sessionIdInput.value = data.session_id;
+                    sessionInfoEl.textContent = 
+                        `Session: ${data.session_id} | Conversation ID: ${data.conversation_id}`;
+                }
             } catch (err) {
                 answerEl.textContent = "Error: " + err;
             } finally {
@@ -267,40 +299,119 @@ async def ingest_url(payload: URLIngestRequest, db: Session = Depends(get_db)):
 
 @app.post("/ask")
 async def ask_question(payload: QuestionRequest, db: Session = Depends(get_db)):
+    """Ask a question with conversation context memory."""
+    memory = MemoryService(db)
+    
+    # Get or create conversation session
+    session_id = payload.session_id or f"session_{dt.datetime.utcnow().timestamp()}"
+    conversation = memory.get_or_create_conversation(session_id)
+    
+    # Get conversation history for context
+    conversation_history = memory.get_recent_context(conversation.id, max_messages=10)
+    
+    # Store user question
+    memory.add_message(conversation.id, "user", payload.question)
+    
+    # Retrieve relevant document chunks
     q_emb = get_embedding(payload.question)
-
     docs = db.query(DocumentChunk).all()
+    
     if not docs:
-        return {"answer": "No data found. Upload PDF first."}
+        answer_text = "No data found. Please upload a PDF or crawl a website first."
+        memory.add_message(conversation.id, "assistant", answer_text)
+        db.commit()
+        return {
+            "answer": answer_text,
+            "session_id": session_id,
+            "conversation_id": conversation.id
+        }
 
+    # Score and rank document chunks
     scored = []
     for d in docs:
         emb = json.loads(d.embedding)
         scored.append((cosine_similarity(q_emb, emb), d.chunk_text))
 
     top = [text for s, text in sorted(scored, reverse=True)[:3]]
+    document_context = "\n\n".join(top)
 
-    context = "\n\n".join(top)
+    # Combine document context with conversation history
+    full_context = ""
+    if conversation_history:
+        full_context = f"Previous conversation:\n{conversation_history}\n\n"
+    full_context += f"Relevant documents:\n{document_context}"
 
+    # Generate answer with context
     try:
-        answer_text = generate_answer(context, payload.question)
+        answer_text = generate_answer(full_context, payload.question)
     except Exception as exc:
         log_event(db, "question_error", {
-        "question": payload.question,
-        "error": str(exc)
-            })
+            "question": payload.question,
+            "session_id": session_id,
+            "error": str(exc)
+        })
         answer_text = (
-            "Answer generation failed; showing raw context instead.\n\n" + context
+            "I apologize, but I encountered an error generating the answer. "
+            "Please try rephrasing your question."
         )
+
+    # Store assistant response
+    memory.add_message(conversation.id, "assistant", answer_text)
 
     log_event(db, "question", {
         "question": payload.question,
+        "session_id": session_id,
+        "conversation_id": conversation.id,
         "context_used": top,
         "answer": answer_text
     })
     db.commit()
 
     return {
-        "context_used": top,
-        "answer": answer_text
+        "answer": answer_text,
+        "session_id": session_id,
+        "conversation_id": conversation.id,
+        "context_used": top
+    }
+
+
+@app.get("/conversations/{session_id}")
+async def get_conversation(session_id: str, db: Session = Depends(get_db)):
+    """Get conversation history for a session."""
+    memory = MemoryService(db)
+    conversation = memory.get_or_create_conversation(session_id)
+    history = memory.get_conversation_history(conversation.id)
+    summary = memory.get_conversation_summary(conversation.id)
+    
+    return {
+        "conversation": summary,
+        "messages": history
+    }
+
+
+@app.delete("/conversations/{session_id}")
+async def clear_conversation(session_id: str, db: Session = Depends(get_db)):
+    """Clear conversation history for a session."""
+    memory = MemoryService(db)
+    conversation = memory.get_or_create_conversation(session_id)
+    cleared = memory.clear_conversation(conversation.id)
+    
+    return {
+        "session_id": session_id,
+        "cleared": cleared,
+        "message": "Conversation history cleared" if cleared else "No messages to clear"
+    }
+
+
+@app.post("/conversations/new")
+async def create_new_conversation(db: Session = Depends(get_db)):
+    """Create a new conversation session."""
+    session_id = f"session_{uuid.uuid4().hex[:12]}"
+    memory = MemoryService(db)
+    conversation = memory.get_or_create_conversation(session_id)
+    
+    return {
+        "session_id": session_id,
+        "conversation_id": conversation.id,
+        "created_at": conversation.created_at.isoformat() if conversation.created_at else None
     }

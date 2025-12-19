@@ -1,3 +1,12 @@
+"""
+Utility functions for RAG chatbot operations.
+
+This module provides:
+- Text processing and chunking
+- Embedding generation
+- PDF and web content extraction
+- Answer generation with context
+"""
 import json
 import math
 from io import BytesIO
@@ -14,7 +23,12 @@ load_dotenv()
 
 GENAI_API_KEY = os.getenv("GOOGLE_API_KEY")
 GENAI_EMBEDDING_MODEL = os.getenv("GOOGLE_EMBEDDING_MODEL", "text-embedding-004")
-GENAI_TEXT_MODEL = os.getenv("GOOGLE_TEXT_MODEL", "models/gemini-2.0-flash")
+GENAI_TEXT_MODEL = os.getenv("GOOGLE_TEXT_MODEL", "models/gemini-2.5-flash")
+
+# Contact information for inquiries
+CONTACT_PHONE = os.getenv("CONTACT_PHONE", "")
+CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", "")
+CONTACT_WHATSAPP = os.getenv("CONTACT_WHATSAPP", CONTACT_PHONE)  # WhatsApp number (can be same as phone)
 
 if not GENAI_API_KEY:
     raise RuntimeError("GOOGLE_API_KEY not found in environment; cannot use embeddings.")
@@ -107,17 +121,72 @@ def fetch_url_text(url: str, max_chars: Optional[int] = 15000):
 
 def generate_answer(context: str, question: str) -> str:
     """
-    Use a text generation model to summarize context into an answer.
+    Use a text generation model to generate an answer with context.
+    Handles conversation history and document context.
+    Includes contact information for inquiries when appropriate.
     """
+    # Build contact information section
+    contact_info = ""
+    if CONTACT_PHONE or CONTACT_EMAIL or CONTACT_WHATSAPP:
+        contact_lines = []
+        
+        if CONTACT_PHONE:
+            contact_lines.append(f" Phone: {CONTACT_PHONE}")
+        
+        if CONTACT_EMAIL:
+            contact_lines.append(f" Email: {CONTACT_EMAIL}")
+        
+        if CONTACT_WHATSAPP:
+            # Format WhatsApp number (remove + if present, add country code if needed)
+            whatsapp_num = CONTACT_WHATSAPP.replace("+", "").replace(" ", "").replace("-", "")
+            whatsapp_link = f"https://wa.me/{whatsapp_num}"
+            contact_lines.append(f" WhatsApp: {CONTACT_WHATSAPP} (Direct message: {whatsapp_link})")
+        
+        contact_info = "\n\n" + "\n".join(contact_lines)
+    
     prompt = (
-        "You are a helpful assistant for a retrieval augmented generation system.\n"
-        "Given the context chunks below, answer the user's question concisely.\n"
-        "If the context does not contain the answer, say you don't know based on the provided data.\n\n"
-        f"Context:\n{context}\n\nQuestion: {question}\nAnswer:"
+        "You are a helpful and professional assistant for a retrieval augmented generation system.\n"
+        "Use the provided context (which may include previous conversation and relevant documents) "
+        "to answer the user's question accurately and concisely.\n"
+        "If the context does not contain enough information to answer the question, "
+        "politely inform the user and suggest they reach out for more detailed information.\n"
+        "Maintain conversation flow and refer to previous exchanges when relevant.\n\n"
+        "IMPORTANT INSTRUCTIONS:\n"
+        "- When a user asks about pricing, quotes, booking, appointments, purchasing, or any inquiry "
+        "that requires direct contact, always provide the contact information below.\n"
+        "- If the question requires clarification or personalized assistance beyond what's in the context, "
+        "politely direct them to contact support.\n"
+        "- Format your responses professionally and include contact information naturally when relevant.\n\n"
+        f"Context:\n{context}\n\n"
+        f"Question: {question}\n\n"
+        "Answer:"
+        f"{contact_info if contact_info else ''}"
     )
-    response = _text_model.generate_content(prompt)
-    print(response)
-    candidate = response.candidates[0]
-    parts = getattr(candidate.content, "parts", [])
-    text = "".join(getattr(part, "text", "") for part in parts)
-    return text.strip() or "No answer generated."
+    
+    try:
+        response = _text_model.generate_content(prompt)
+        candidate = response.candidates[0]
+        parts = getattr(candidate.content, "parts", [])
+        text = "".join(getattr(part, "text", "") for part in parts)
+        answer = text.strip() or "No answer generated."
+        
+        # Append contact info if answer indicates inquiry/contact needed and not already included
+        if contact_info and any(keyword in question.lower() for keyword in [
+            "contact", "reach", "phone", "email", "whatsapp", "inquiry", "inquire", 
+            "price", "pricing", "cost", "quote", "book", "booking", "appointment",
+            "purchase", "buy", "order", "support", "help", "assistance"
+        ]):
+            if CONTACT_PHONE not in answer and CONTACT_EMAIL not in answer:
+                answer += f"\n\n---\n For inquiries, please reach out:\n"
+                if CONTACT_PHONE:
+                    answer += f"Phone: {CONTACT_PHONE}\n"
+                if CONTACT_EMAIL:
+                    answer += f"Email: {CONTACT_EMAIL}\n"
+                if CONTACT_WHATSAPP:
+                    whatsapp_num = CONTACT_WHATSAPP.replace("+", "").replace(" ", "").replace("-", "")
+                    whatsapp_link = f"https://wa.me/{whatsapp_num}"
+                    answer += f"WhatsApp: {CONTACT_WHATSAPP} - Click to message: {whatsapp_link}\n"
+        
+        return answer
+    except Exception as e:
+        raise RuntimeError(f"Failed to generate answer: {str(e)}") from e
